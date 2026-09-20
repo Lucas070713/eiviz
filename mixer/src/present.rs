@@ -39,6 +39,8 @@ pub struct Presenter {
     /// A stall was already reported; cleared once a frame reaches the surface
     /// again, so one stuck presenter logs one line instead of one per frame.
     stall_noted: bool,
+    /// Last screen rect seen by [`Presenters::windows_moved`].
+    window_rect: Option<(i32, i32, i32, i32)>,
 }
 
 #[derive(Default)]
@@ -213,6 +215,23 @@ impl Presenters {
         reconfigure_pending_inner(device, self);
     }
 
+    /// True when an attached surface's window moved or resized since the last
+    /// call. Windows never tells the render thread that a drag is under way, and
+    /// presenting at the panel's rate through one fights the UI thread, so the
+    /// caller pauses the repaint until the window settles. Call once per mix
+    /// tick: this is a syscall per surface.
+    pub fn windows_moved(&mut self) -> bool {
+        let mut moved = false;
+        for presenter in self.by_key.values_mut().chain(self.monitors.values_mut()) {
+            let rect = native_window_rect(presenter.native);
+            if rect.is_some() && presenter.window_rect.is_some() && rect != presenter.window_rect {
+                moved = true;
+            }
+            presenter.window_rect = rect;
+        }
+        moved
+    }
+
     /// Highest current refresh rate (Hz) among the monitors hosting the
     /// currently attached surfaces. #233: eiviz composes at the mix clock but
     /// must present at the panel's own rate, or windowed VRR follows the
@@ -375,6 +394,7 @@ fn presenter_from_prepared(
         native,
         frame_slot: false,
         stall_noted: false,
+        window_rect: None,
     })
 }
 
@@ -638,6 +658,38 @@ fn native_client_size(surface: NativeSurface) -> Option<(u32, u32)> {
 
 #[cfg(not(windows))]
 fn native_client_size(_surface: NativeSurface) -> Option<(u32, u32)> {
+    None
+}
+
+#[cfg(windows)]
+fn native_window_rect(surface: NativeSurface) -> Option<(i32, i32, i32, i32)> {
+    if surface.kind != crate::abi::NATIVE_WIN32_HWND {
+        return None;
+    }
+    #[repr(C)]
+    struct WinRect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+    unsafe extern "system" {
+        fn GetWindowRect(hwnd: isize, rect: *mut WinRect) -> i32;
+    }
+    let mut rect = WinRect {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    if unsafe { GetWindowRect(surface.handle, &mut rect) } == 0 {
+        return None;
+    }
+    Some((rect.left, rect.top, rect.right, rect.bottom))
+}
+
+#[cfg(not(windows))]
+fn native_window_rect(_surface: NativeSurface) -> Option<(i32, i32, i32, i32)> {
     None
 }
 

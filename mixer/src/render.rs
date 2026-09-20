@@ -51,6 +51,12 @@ pub(crate) fn render_loop(
     let mut display_probe = Instant::now()
         .checked_sub(Duration::from_secs(1))
         .unwrap_or_else(Instant::now);
+    // Repainting at the panel's rate through a window drag fights the UI thread
+    // for the compositor, and the drag visibly stutters. Pause the repaint until
+    // the window has held still; a drag is transient, so VRR flicker over it is
+    // not worth a janky drag.
+    const WINDOW_SETTLE: Duration = Duration::from_millis(250);
+    let mut window_still_since = Instant::now();
     while !stop.load(Ordering::Relaxed) && !crate::diag::is_fatal() {
         while let Ok(cmd) = cmds.try_recv() {
             match cmd {
@@ -227,8 +233,12 @@ pub(crate) fn render_loop(
         // rate on the way (#233). The repaint stays inside the wait so the per-frame
         // work above it — surface reconfigure, shared-state snapshots — keeps running
         // once per mix tick and never at the (much faster) panel rate.
+        if presenters.windows_moved() {
+            window_still_since = Instant::now();
+        }
+        let repaint_due = repaint_rate.is_some() && window_still_since.elapsed() >= WINDOW_SETTLE;
         let mix_deadline = master_cursor.next_deadline(clock);
-        while repaint_rate.is_some() {
+        while repaint_due {
             let repaint_deadline = repaint_cursor.next_deadline(clock);
             if repaint_deadline >= mix_deadline {
                 break;
