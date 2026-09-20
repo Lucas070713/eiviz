@@ -248,6 +248,7 @@ pub(crate) fn render_loop(
                 &mut presenters,
                 &composer,
                 &frame_delay,
+                true,
                 &telemetry,
             ) {
                 break;
@@ -258,6 +259,7 @@ pub(crate) fn render_loop(
                 &composer,
                 &frame_delay,
                 repaint_i,
+                true,
                 &telemetry,
             );
         }
@@ -471,6 +473,7 @@ pub(crate) fn render_loop(
                 &mut presenters,
                 &composer,
                 &frame_delay,
+                false,
                 &telemetry,
             ) {
                 break;
@@ -686,6 +689,7 @@ pub(crate) fn render_loop(
                 &composer,
                 &frame_delay,
                 frame_i,
+                false,
                 &telemetry,
             );
             let compose_vram = composer.vram_bytes();
@@ -733,11 +737,12 @@ fn present_unit_buses_shared(
     presenters: &mut Presenters,
     composer: &Composer,
     frame_delay: &FrameDelay,
+    repaint: bool,
     telemetry: &Mutex<Telemetry>,
 ) -> bool {
     let epoch = composer.gpu_epoch() ^ frame_delay.epoch().rotate_left(8);
     match panic::catch_unwind(AssertUnwindSafe(|| {
-        presenters.present_unit_buses(device, epoch, |unit_id, kind| {
+        presenters.present_unit_buses(device, epoch, repaint, |unit_id, kind| {
             frame_delay
                 .view(unit_id, kind)
                 .or_else(|| composer.unit_view(unit_id, kind))
@@ -769,6 +774,7 @@ fn present_monitors_shared(
     composer: &Composer,
     frame_delay: &FrameDelay,
     frame_i: u64,
+    repaint: bool,
     telemetry: &Mutex<Telemetry>,
 ) {
     if !presenters.any_monitor_due(frame_i) {
@@ -776,12 +782,14 @@ fn present_monitors_shared(
     }
     let epoch = composer.gpu_epoch() ^ frame_delay.epoch().rotate_left(8);
     if panic::catch_unwind(AssertUnwindSafe(|| {
-        if let Err(error) = presenters.present_monitors(device, epoch, frame_i, |source_id| {
-            frame_delay
-                .view_for_source(source_id)
-                .or_else(|| composer.view_for_source(source_id))
-                .map(|view| (view, composer.source_is_packed(source_id)))
-        }) {
+        if let Err(error) =
+            presenters.present_monitors(device, epoch, frame_i, repaint, |source_id| {
+                frame_delay
+                    .view_for_source(source_id)
+                    .or_else(|| composer.view_for_source(source_id))
+                    .map(|view| (view, composer.source_is_packed(source_id)))
+            })
+        {
             set_error(telemetry, error);
         }
     }))

@@ -36,6 +36,9 @@ pub struct Presenter {
     native: NativeSurface,
     /// A DXGI frame-latency slot was taken and not yet spent by a present.
     frame_slot: bool,
+    /// A stall was already reported; cleared once a frame reaches the surface
+    /// again, so one stuck presenter logs one line instead of one per frame.
+    stall_noted: bool,
 }
 
 #[derive(Default)]
@@ -161,6 +164,7 @@ impl Presenters {
         &mut self,
         device: &GpuDevice,
         epoch: u64,
+        repaint: bool,
         view_for: impl Fn(u64, u32) -> Option<wgpu::TextureView>,
     ) -> Result<(), String> {
         let planned: Vec<_> = self
@@ -172,7 +176,7 @@ impl Presenters {
                 (unit_id, kind, surface, cache_key, view_for(unit_id, kind))
             })
             .collect();
-        present_pass(self, device, &planned)
+        present_pass(self, device, repaint, &planned)
     }
 
     pub fn present_monitors(
@@ -180,6 +184,7 @@ impl Presenters {
         device: &GpuDevice,
         epoch: u64,
         frame_i: u64,
+        repaint: bool,
         source_view: impl Fn(u64) -> Option<(wgpu::TextureView, bool)>,
     ) -> Result<(), String> {
         let due: Vec<u64> = self
@@ -193,9 +198,9 @@ impl Presenters {
                 !is_preview_surface(presenter.config.width, presenter.config.height)
             })
         });
-        present_monitor_group(self, device, epoch, &tiles, &source_view)?;
+        present_monitor_group(self, device, epoch, repaint, &tiles, &source_view)?;
         for id in previews {
-            present_monitor_group(self, device, epoch, &[id], &source_view)?;
+            present_monitor_group(self, device, epoch, repaint, &[id], &source_view)?;
         }
         Ok(())
     }
@@ -369,6 +374,7 @@ fn presenter_from_prepared(
         occluded_streak: 0,
         native,
         frame_slot: false,
+        stall_noted: false,
     })
 }
 
@@ -392,6 +398,7 @@ fn present_monitor_group(
     presenters: &mut Presenters,
     device: &GpuDevice,
     epoch: u64,
+    repaint: bool,
     ids: &[u64],
     source_view: &impl Fn(u64) -> Option<(wgpu::TextureView, bool)>,
 ) -> Result<(), String> {
@@ -410,12 +417,13 @@ fn present_monitor_group(
             Some((monitor_id, source_id ^ epoch.rotate_left(8), view, packed))
         })
         .collect();
-    present_monitor_pass(presenters, device, &planned)
+    present_monitor_pass(presenters, device, repaint, &planned)
 }
 
 fn present_pass(
     presenters: &mut Presenters,
     device: &GpuDevice,
+    repaint: bool,
     planned: &[(
         u64,
         u32,
@@ -440,6 +448,7 @@ fn present_pass(
             *cache_key,
             view.as_ref(),
             false,
+            repaint,
             &mut encoder,
         ) {
             acquired.push(item);
@@ -451,6 +460,7 @@ fn present_pass(
 fn present_monitor_pass(
     presenters: &mut Presenters,
     device: &GpuDevice,
+    repaint: bool,
     planned: &[(u64, u64, Option<wgpu::TextureView>, bool)],
 ) -> Result<(), String> {
     let mut encoder = device
@@ -469,6 +479,7 @@ fn present_monitor_pass(
             *cache_key,
             view.as_ref(),
             *packed,
+            repaint,
             &mut encoder,
         ) {
             acquired.push(item);
@@ -495,7 +506,17 @@ fn apply_pending_size(device: &GpuDevice, presenter: &mut Presenter) {
     let mut config = presenter.config.clone();
     config.width = width;
     config.height = height;
-    if configure_surface(&device.device, &presenter.surface, &config).is_ok() {
+    if let Err(error) = configure_surface(&device.device, &presenter.surface, &config) {
+        // Silently leaving ready=false here is what turns a transient configure
+        // failure into a permanently frozen Preview/Program with an empty log.
+        if !presenter.stall_noted {
+            presenter.stall_noted = true;
+            crate::diag::error(&format!(
+                "present stalled: {error} at {width}x{height} (hwnd={:#x})",
+                presenter.native.handle
+            ));
+        }
+    } else {
         presenter.config = config;
         presenter.bind = None;
         presenter.bind_key = 0;
@@ -768,7 +789,15 @@ fn take_frame_slot(_presenter: &mut Presenter) -> bool {
 fn acquire_surface_texture(
     device: &GpuDevice,
     presenter: &mut Presenter,
+    repaint: bool,
 ) -> Option<wgpu::SurfaceTexture> {
+    // A repaint only re-presents a surface that is already good. Extent probing,
+    // rebuilds and Surface::configure stay on the mix tick: configure waits for
+    // the present queue to go idle under the GPU queue lock, and running that at
+    // the panel's rate fights the UI thread for the whole of a window drag.
+    if repaint {
+        return repaint_surface_texture(presenter);
+    }
     // While a GridSplitter is dragged the HWND extent changes every layout
     // tick, so Vulkan WSI returns Outdated. Rebuild from GetClientRect and
     // retry in this call; skipping the frame leaves Preview/Program frozen
@@ -776,6 +805,7 @@ fn acquire_surface_texture(
     for _ in 0..8 {
         sync_presenter_extent(device, presenter);
         if !presenter.ready {
+            note_stall(presenter, "surface is not configured");
             return None;
         }
         // The display has not retired a queued frame yet. Drop this preview frame
@@ -812,6 +842,7 @@ fn acquire_surface_texture(
                 // This texture is always presented by submit_presents, which
                 // spends the slot; the next acquire must poll for a new one.
                 presenter.frame_slot = false;
+                presenter.stall_noted = false;
                 return Some(texture);
             }
             wgpu::CurrentSurfaceTexture::Suboptimal(texture) => {
@@ -834,7 +865,65 @@ fn acquire_surface_texture(
             }
         }
     }
+    note_stall(presenter, "acquire kept rebuilding the surface");
     None
+}
+
+/// Cheap path for the between-mix-ticks repaint: acquire and hand back a frame
+/// only when the surface needs no work, and never touch presenter state that the
+/// mix tick owns. Anything unusual is left for the next mix tick to resolve.
+fn repaint_surface_texture(presenter: &mut Presenter) -> Option<wgpu::SurfaceTexture> {
+    if !presenter.ready || presenter.pending.is_some() {
+        return None;
+    }
+    if !take_frame_slot(presenter) {
+        return None;
+    }
+    // wgpu 30 panics in Surface::get_current_texture when the HAL surface was
+    // never configured (error_sink is None). Device error scopes do not catch that.
+    let acquired = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        presenter.surface.get_current_texture()
+    })) {
+        Ok(acquired) => acquired,
+        Err(_) => {
+            crate::diag::error("surface get_current_texture panicked");
+            presenter.ready = false;
+            presenter.pending = None;
+            return None;
+        }
+    };
+    match acquired {
+        wgpu::CurrentSurfaceTexture::Success(texture) => {
+            if native_client_size(presenter.native)
+                .is_some_and(|size| size != (presenter.config.width, presenter.config.height))
+            {
+                // The window moved under us mid-drag; the mix tick reconfigures.
+                drop(texture);
+                return None;
+            }
+            presenter.frame_slot = false;
+            Some(texture)
+        }
+        _ => None,
+    }
+}
+
+/// A presenter that stops acquiring stays silent otherwise, so a stuck
+/// Preview/Program looks like a hang with nothing in the log to go on.
+fn note_stall(presenter: &mut Presenter, reason: &str) {
+    if presenter.stall_noted {
+        return;
+    }
+    presenter.stall_noted = true;
+    let client = native_client_size(presenter.native);
+    crate::diag::error(&format!(
+        "present stalled: {reason} (config={}x{} pending={:?} client={:?} hwnd={:#x})",
+        presenter.config.width,
+        presenter.config.height,
+        presenter.pending,
+        client,
+        presenter.native.handle,
+    ));
 }
 
 fn draw_presenter(
@@ -843,9 +932,10 @@ fn draw_presenter(
     cache_key: u64,
     src: Option<&wgpu::TextureView>,
     packed: bool,
+    repaint: bool,
     encoder: &mut wgpu::CommandEncoder,
 ) -> Option<(wgpu::SurfaceTexture, wgpu::TextureView)> {
-    let texture = acquire_surface_texture(device, presenter)?;
+    let texture = acquire_surface_texture(device, presenter, repaint)?;
     let dest = texture.texture.create_view(&Default::default());
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
