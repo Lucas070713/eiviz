@@ -28,6 +28,13 @@ pub(crate) fn render_loop(
         crate::clock::PlayoutCursor::new(crate::clock::Rate::or_default(fps_num, fps_den));
     let mut frame_i;
     let mut unit_compose_idx: HashMap<u64, u64> = HashMap::new();
+    // What the on-screen surfaces are being fed. When this stops changing, the
+    // panes hold a still frame even though compose and present both report fine.
+    let mut last_present_epoch = u64::MAX;
+    let mut present_epoch_since = Instant::now();
+    let mut present_epoch_noted = false;
+    // Per unit: when it last composed, and whether that stall was reported.
+    let mut unit_composed_at: HashMap<u64, (Instant, bool)> = HashMap::new();
     let mut snapshot = Vec::new();
     let mut scene_specs = Vec::new();
     let mut scene_labels = HashMap::new();
@@ -74,6 +81,11 @@ pub(crate) fn render_loop(
                     })) {
                         Ok(Ok(())) => {
                             shared.lock().expect("shared").compose_dirty = true;
+                            crate::diag::info(&format!(
+                                "attach surface unit={unit_id} kind={kind} hwnd={:#x} surfaces={}",
+                                surface.handle,
+                                presenters.attached_count()
+                            ));
                             OK
                         }
                         Ok(Err(error)) => {
@@ -103,6 +115,11 @@ pub(crate) fn render_loop(
                     reply,
                 } => {
                     presenters.detach(unit_id, kind, surface);
+                    crate::diag::info(&format!(
+                        "detach surface unit={unit_id} kind={kind} hwnd={:#x} surfaces={}",
+                        surface.handle,
+                        presenters.attached_count()
+                    ));
                     let _ = reply.send(OK);
                 }
                 GpuCmd::DetachUnit { unit_id, reply } => {
@@ -221,6 +238,7 @@ pub(crate) fn render_loop(
                     None => crate::diag::info("present repaint follows the mix rate"),
                 }
             }
+            presenters.probe_occlusion();
             display_probe = Instant::now();
         }
         frame_delay.set_depth(buffer_frames);
@@ -478,6 +496,22 @@ pub(crate) fn render_loop(
             let need_prv = outputs_snap
                 .iter()
                 .any(|item| item.source_kind == SRC_KIND_MU_PREVIEW && item.cpu_video());
+            let screen_epoch = composer.gpu_epoch() ^ frame_delay.epoch().rotate_left(8);
+            if screen_epoch == last_present_epoch {
+                if !present_epoch_noted && present_epoch_since.elapsed() >= Duration::from_secs(2) {
+                    present_epoch_noted = true;
+                    crate::diag::error(&format!(
+                        "on-screen content frozen for {:.1}s: compose epoch={} delay epoch={}",
+                        present_epoch_since.elapsed().as_secs_f32(),
+                        composer.gpu_epoch(),
+                        frame_delay.epoch()
+                    ));
+                }
+            } else {
+                last_present_epoch = screen_epoch;
+                present_epoch_since = Instant::now();
+                present_epoch_noted = false;
+            }
             if present_unit_buses_shared(
                 &device,
                 &mut presenters,
@@ -598,11 +632,37 @@ pub(crate) fn render_loop(
             {
                 let unit_rate = crate::clock::Rate::or_default(*unit_fps_n, *unit_fps_d);
                 let ideal = clock.frames_elapsed(unit_rate, Instant::now());
+                let seen = unit_composed_at
+                    .entry(*unit_id)
+                    .or_insert_with(|| (Instant::now(), false));
                 let last = unit_compose_idx.entry(*unit_id).or_insert(u64::MAX);
                 if *last != u64::MAX && ideal <= *last {
-                    continue;
+                    if ideal == *last {
+                        // A unit that stops composing keeps its last frame on
+                        // screen with nothing in the log, while scenes, monitors
+                        // and thumbnails carry on as if all were well.
+                        if !seen.1 && seen.0.elapsed() >= Duration::from_secs(2) {
+                            seen.1 = true;
+                            crate::diag::error(&format!(
+                                "unit {unit_id} has not composed for {:.1}s (ideal={ideal} last={} rate={unit_fps_n}/{unit_fps_d})",
+                                seen.0.elapsed().as_secs_f32(),
+                                *last
+                            ));
+                        }
+                        continue;
+                    }
+                    // `ideal` only counts forward while the unit keeps its rate.
+                    // A rate change rescales it, and after a drop the cached index
+                    // sits above every index this unit will ever reach again — which
+                    // left its Preview and Program frozen for the rest of the run
+                    // while scenes, monitors and thumbnails carried on.
+                    crate::diag::info(&format!(
+                        "unit {unit_id} compose index rescaled {} -> {ideal} at {unit_fps_n}/{unit_fps_d}",
+                        *last
+                    ));
                 }
                 *last = ideal;
+                *seen = (Instant::now(), false);
                 composer.ensure_unit(&device, *unit_id, *width, *height);
                 if let Err(error) =
                     composer.set_custom_mix(&device, *unit_id, custom.as_deref().unwrap_or(""))

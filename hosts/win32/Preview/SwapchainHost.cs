@@ -16,6 +16,7 @@ internal sealed partial class SwapchainHost : HwndHost
     private uint _sizedHeight;
     private bool _syncing;
     private bool _applying;
+    private bool _loggedBudgetRefusal;
 
     private ulong _unitId = 1;
 
@@ -187,7 +188,17 @@ internal sealed partial class SwapchainHost : HwndHost
             if (!forceAttach && !AutoAttach)
                 return;
             if (!FlipBudget.TryBegin(this))
+            {
+                // Refusing here is what leaves Preview/Program permanently blank
+                // with nothing in either log to explain it.
+                if (!_loggedBudgetRefusal)
+                {
+                    _loggedBudgetRefusal = true;
+                    HostLog.Write("WARN", $"Flip budget refused a surface: unit={UnitId} kind={OutputKind} monitor={MonitorId} live={FlipBudget.LiveCount} max={FlipBudget.Max}");
+                }
                 return;
+            }
+            _loggedBudgetRefusal = false;
             try
             {
                 if (IsMonitor)

@@ -88,6 +88,10 @@ internal static class FlipBudget
             GpuPresentStore.Save(Live.Count);
     }
 
+    public static int LiveCount => Live.Count;
+
+    public static int Max => EffectiveMax();
+
     private static int EffectiveMax() =>
         _limitSetting == 0 ? _ceiling : (int)_limitSetting;
 

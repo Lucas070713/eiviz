@@ -41,6 +41,10 @@ pub struct Presenter {
     stall_noted: bool,
     /// Last screen rect seen by [`Presenters::windows_moved`].
     window_rect: Option<(i32, i32, i32, i32)>,
+    /// Whether the swapchain last reported itself occluded.
+    occluded: bool,
+    /// When the frame-latency wait started coming back empty, if it has.
+    slot_wait_since: Option<std::time::Instant>,
 }
 
 #[derive(Default)]
@@ -213,6 +217,47 @@ impl Presenters {
         // when the host (or cargo test) is on main waiting for this thread
         // — attach reply, mixer_destroy join, or a sleeping integration test.
         reconfigure_pending_inner(device, self);
+    }
+
+    /// DXGI answers `Present` with the success code `DXGI_STATUS_OCCLUDED` once a
+    /// flip-model swapchain stops reaching the screen, and wgpu maps every success
+    /// code to Ok. Presents then go nowhere while compose, acquire and present all
+    /// report fine and the pane holds its last frame, so poll for it and say so.
+    #[cfg(windows)]
+    pub fn probe_occlusion(&mut self) {
+        for presenter in self.by_key.values_mut().chain(self.monitors.values_mut()) {
+            let Some(occluded) = swapchain_occluded(presenter) else {
+                continue;
+            };
+            if occluded == presenter.occluded {
+                continue;
+            }
+            presenter.occluded = occluded;
+            if occluded {
+                // Report only: a covered or minimised window is occluded for
+                // good reason, and rebuilding the surface under it would be
+                // churn. This is here so a pane that stops updating says why.
+                crate::diag::info(&format!(
+                    "swapchain is occluded, presents are not reaching the screen (hwnd={:#x})",
+                    presenter.native.handle
+                ));
+            } else {
+                crate::diag::info(&format!(
+                    "swapchain reaches the screen again (hwnd={:#x})",
+                    presenter.native.handle
+                ));
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    pub fn probe_occlusion(&mut self) {}
+
+    /// Number of attached surfaces, for the attach/detach diagnostics: a
+    /// Preview/Program that silently stops presenting is almost always a
+    /// surface that went away and never came back.
+    pub fn attached_count(&self) -> usize {
+        self.by_key.len() + self.monitors.len()
     }
 
     /// True when an attached surface's window moved or resized since the last
@@ -395,6 +440,8 @@ fn presenter_from_prepared(
         frame_slot: false,
         stall_noted: false,
         window_rect: None,
+        occluded: false,
+        slot_wait_since: None,
     })
 }
 
@@ -542,9 +589,9 @@ fn apply_pending_size(device: &GpuDevice, presenter: &mut Presenter) {
         presenter.bind_key = 0;
         presenter.pending = None;
         presenter.ready = true;
-        // ResizeBuffers hands out a fresh waitable; any slot taken on the old
-        // one is gone with it.
-        presenter.frame_slot = false;
+        // Keep any slot already taken: dropping it here is what used to leak
+        // counts out of the waitable's semaphore, one per rebuild.
+        presenter.slot_wait_since = None;
     }
 }
 
@@ -693,6 +740,21 @@ fn native_window_rect(_surface: NativeSurface) -> Option<(i32, i32, i32, i32)> {
     None
 }
 
+/// `None` when the surface is not a live DX12 swapchain to ask.
+#[cfg(windows)]
+fn swapchain_occluded(presenter: &Presenter) -> Option<bool> {
+    use windows::Win32::Foundation::DXGI_STATUS_OCCLUDED;
+    use windows::Win32::Graphics::Dxgi::DXGI_PRESENT_TEST;
+
+    // SAFETY: the hal guard keeps the swapchain alive for the call, and
+    // DXGI_PRESENT_TEST only queries presentability - it presents nothing.
+    unsafe {
+        let hal = presenter.surface.as_hal::<wgpu::hal::api::Dx12>()?;
+        let swap_chain = hal.swap_chain()?;
+        Some(swap_chain.Present(0, DXGI_PRESENT_TEST) == DXGI_STATUS_OCCLUDED)
+    }
+}
+
 #[cfg(windows)]
 fn surface_refresh_hz(surface: NativeSurface) -> Option<u32> {
     const MONITOR_DEFAULTTONEAREST: u32 = 2;
@@ -816,6 +878,7 @@ fn take_frame_slot(presenter: &mut Presenter) -> bool {
     use windows::Win32::System::Threading::WaitForSingleObject;
 
     if presenter.frame_slot {
+        presenter.slot_wait_since = None;
         return true;
     }
     // SAFETY: the handle is only used while the hal guard keeps the swapchain
@@ -830,7 +893,35 @@ fn take_frame_slot(presenter: &mut Presenter) -> bool {
         }
     };
     presenter.frame_slot = ready;
-    ready
+    if ready {
+        presenter.slot_wait_since = None;
+        return true;
+    }
+    // The waitable is a semaphore: a successful wait takes a count and only a
+    // present gives one back. A count taken for an acquire that then rebuilt the
+    // surface instead of presenting is gone for good, so after a few resizes the
+    // semaphore can sit empty — and an empty semaphore means no present, which
+    // means it is never refilled again. The wait only paces us, so give up on it
+    // rather than let it gate presenting: the present that follows refills it.
+    const GIVE_UP: std::time::Duration = std::time::Duration::from_millis(100);
+    let waiting = presenter
+        .slot_wait_since
+        .get_or_insert_with(std::time::Instant::now)
+        .elapsed();
+    if waiting < GIVE_UP {
+        return false;
+    }
+    presenter.slot_wait_since = None;
+    presenter.frame_slot = true;
+    if !presenter.stall_noted {
+        presenter.stall_noted = true;
+        crate::diag::error(&format!(
+            "frame-latency slots ran dry after {:.0}ms; presenting anyway to refill (hwnd={:#x})",
+            waiting.as_secs_f32() * 1000.0,
+            presenter.native.handle
+        ));
+    }
+    true
 }
 
 #[cfg(not(windows))]
