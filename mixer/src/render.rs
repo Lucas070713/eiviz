@@ -39,6 +39,18 @@ pub(crate) fn render_loop(
         .checked_sub(Duration::from_secs(1))
         .unwrap_or_else(Instant::now);
     let mut pending_snapshots: Vec<(u64, u32, String, mpsc::Sender<i32>)> = Vec::new();
+    // #233: DXGI presents drive windowed VRR. Presenting on-screen surfaces at the
+    // mix clock (e.g. 59.94 Hz) makes the panel follow that slow cadence and flicker
+    // the whole display, so repaint_cursor re-presents the already-composed image at
+    // the display's own rate, independent of master_cursor. The Vulkan and Metal
+    // present paths do not drive VRR, so they keep repainting on the mix clock.
+    let repaints_on_display_rate = device.adapter.get_info().backend == wgpu::Backend::Dx12;
+    let mut repaint_cursor =
+        crate::clock::PlayoutCursor::new(crate::clock::Rate::or_default(fps_num, fps_den));
+    let mut repaint_rate: Option<crate::clock::Rate> = None;
+    let mut display_probe = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
     while !stop.load(Ordering::Relaxed) && !crate::diag::is_fatal() {
         while let Ok(cmd) = cmds.try_recv() {
             match cmd {
@@ -190,13 +202,66 @@ pub(crate) fn render_loop(
         };
         let master_rate = crate::clock::Rate::or_default(fps_num, fps_den);
         master_cursor.set_rate(clock, Instant::now(), master_rate);
+        if repaints_on_display_rate && display_probe.elapsed() >= Duration::from_secs(1) {
+            let next_repaint_rate =
+                crate::present::repaint_rate(presenters.display_hz(), master_rate);
+            if next_repaint_rate != repaint_rate {
+                repaint_rate = next_repaint_rate;
+                match repaint_rate {
+                    Some(rate) => {
+                        repaint_cursor.set_rate(clock, Instant::now(), rate);
+                        crate::diag::info(&format!("present repaint rate={:.2}Hz", rate.as_f64()));
+                    }
+                    None => crate::diag::info("present repaint follows the mix rate"),
+                }
+            }
+            display_probe = Instant::now();
+        }
         frame_delay.set_depth(buffer_frames);
         shared
             .lock()
             .expect("shared")
             .audio
             .set_video_delay(buffer_frames, fps_num, fps_den);
-        crate::frame_hub::sleep_until_deadline(master_cursor.next_deadline(clock), stop.as_ref());
+        // Wait out the mix tick, re-presenting the composed image at the display's
+        // rate on the way (#233). The repaint stays inside the wait so the per-frame
+        // work above it — surface reconfigure, shared-state snapshots — keeps running
+        // once per mix tick and never at the (much faster) panel rate.
+        let mix_deadline = master_cursor.next_deadline(clock);
+        while repaint_rate.is_some() {
+            let repaint_deadline = repaint_cursor.next_deadline(clock);
+            if repaint_deadline >= mix_deadline {
+                break;
+            }
+            crate::frame_hub::sleep_until_deadline(repaint_deadline, stop.as_ref());
+            if stop.load(Ordering::Relaxed) || crate::diag::is_fatal() {
+                break;
+            }
+            if repaint_cursor.due(clock, Instant::now()).is_none() {
+                continue;
+            }
+            // Nothing new has been composed, so this only re-presents: no compose,
+            // upload, delay-ring, audio, output or telemetry state may advance here.
+            let repaint_i = master_cursor.idx.saturating_sub(1);
+            if present_unit_buses_shared(
+                &device,
+                &mut presenters,
+                &composer,
+                &frame_delay,
+                &telemetry,
+            ) {
+                break;
+            }
+            present_monitors_shared(
+                &device,
+                &mut presenters,
+                &composer,
+                &frame_delay,
+                repaint_i,
+                &telemetry,
+            );
+        }
+        crate::frame_hub::sleep_until_deadline(mix_deadline, stop.as_ref());
         if stop.load(Ordering::Relaxed) || crate::diag::is_fatal() {
             break;
         }
@@ -401,28 +466,14 @@ pub(crate) fn render_loop(
             let need_prv = outputs_snap
                 .iter()
                 .any(|item| item.source_kind == SRC_KIND_MU_PREVIEW && item.cpu_video());
-            let present_epoch = composer.gpu_epoch() ^ frame_delay.epoch().rotate_left(8);
-            match panic::catch_unwind(AssertUnwindSafe(|| {
-                presenters.present_unit_buses(&device, present_epoch, |unit_id, kind| {
-                    frame_delay
-                        .view(unit_id, kind)
-                        .or_else(|| composer.unit_view(unit_id, kind))
-                })
-            })) {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    set_error(&telemetry, error.clone());
-                    if error.contains("unconfigured") {
-                        crate::diag::mark_fatal(error);
-                        break;
-                    }
-                }
-                Err(_) => {
-                    crate::diag::error("present unit buses panicked");
-                    set_error(&telemetry, "present panicked");
-                    crate::diag::mark_fatal("present unit buses panicked");
-                    break;
-                }
+            if present_unit_buses_shared(
+                &device,
+                &mut presenters,
+                &composer,
+                &frame_delay,
+                &telemetry,
+            ) {
+                break;
             }
             {
                 let mut encoder =
@@ -629,26 +680,14 @@ pub(crate) fn render_loop(
             thumbs.advance(&device);
             emit_packed(&mut readbacks, &device, &packed_copies, &outputs_snap);
             emit_gpu_encode(&gpu_copies, pts);
-            if presenters.any_monitor_due(frame_i) {
-                let monitor_epoch = composer.gpu_epoch() ^ frame_delay.epoch().rotate_left(8);
-                if panic::catch_unwind(AssertUnwindSafe(|| {
-                    if let Err(error) =
-                        presenters.present_monitors(&device, monitor_epoch, frame_i, |source_id| {
-                            frame_delay
-                                .view_for_source(source_id)
-                                .or_else(|| composer.view_for_source(source_id))
-                                .map(|view| (view, composer.source_is_packed(source_id)))
-                        })
-                    {
-                        set_error(&telemetry, error);
-                    }
-                }))
-                .is_err()
-                {
-                    crate::diag::error("present monitors panicked");
-                    set_error(&telemetry, "present monitors panicked");
-                }
-            }
+            present_monitors_shared(
+                &device,
+                &mut presenters,
+                &composer,
+                &frame_delay,
+                frame_i,
+                &telemetry,
+            );
             let compose_vram = composer.vram_bytes();
             let delay_vram = frame_delay.vram_bytes();
             let send_vram = gpu_sends.vram_bytes();
@@ -681,6 +720,75 @@ pub(crate) fn render_loop(
                 }
             }
         }
+    }
+}
+
+/// Draws whatever is already composed onto every attached unit-bus surface.
+/// The epoch/cache-key expression matches the mix path exactly so
+/// `Presenter::bind` stays cached when nothing new has been composed (#233
+/// repaint-only ticks rely on this to be a plain re-blit). Returns true when
+/// the caller must break out of the render loop (fatal).
+fn present_unit_buses_shared(
+    device: &GpuDevice,
+    presenters: &mut Presenters,
+    composer: &Composer,
+    frame_delay: &FrameDelay,
+    telemetry: &Mutex<Telemetry>,
+) -> bool {
+    let epoch = composer.gpu_epoch() ^ frame_delay.epoch().rotate_left(8);
+    match panic::catch_unwind(AssertUnwindSafe(|| {
+        presenters.present_unit_buses(device, epoch, |unit_id, kind| {
+            frame_delay
+                .view(unit_id, kind)
+                .or_else(|| composer.unit_view(unit_id, kind))
+        })
+    })) {
+        Ok(Ok(())) => false,
+        Ok(Err(error)) => {
+            set_error(telemetry, error.clone());
+            if error.contains("unconfigured") {
+                crate::diag::mark_fatal(error);
+                true
+            } else {
+                false
+            }
+        }
+        Err(_) => {
+            crate::diag::error("present unit buses panicked");
+            set_error(telemetry, "present panicked");
+            crate::diag::mark_fatal("present unit buses panicked");
+            true
+        }
+    }
+}
+
+/// Same idea as [`present_unit_buses_shared`], for monitor surfaces.
+fn present_monitors_shared(
+    device: &GpuDevice,
+    presenters: &mut Presenters,
+    composer: &Composer,
+    frame_delay: &FrameDelay,
+    frame_i: u64,
+    telemetry: &Mutex<Telemetry>,
+) {
+    if !presenters.any_monitor_due(frame_i) {
+        return;
+    }
+    let epoch = composer.gpu_epoch() ^ frame_delay.epoch().rotate_left(8);
+    if panic::catch_unwind(AssertUnwindSafe(|| {
+        if let Err(error) = presenters.present_monitors(device, epoch, frame_i, |source_id| {
+            frame_delay
+                .view_for_source(source_id)
+                .or_else(|| composer.view_for_source(source_id))
+                .map(|view| (view, composer.source_is_packed(source_id)))
+        }) {
+            set_error(telemetry, error);
+        }
+    }))
+    .is_err()
+    {
+        crate::diag::error("present monitors panicked");
+        set_error(telemetry, "present monitors panicked");
     }
 }
 

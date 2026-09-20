@@ -219,6 +219,9 @@ fn instance_descriptor(backends: wgpu::Backends) -> wgpu::InstanceDescriptor {
         backend_options: wgpu::BackendOptions {
             dx12: wgpu::Dx12BackendOptions {
                 shader_compiler: dx12_shader_compiler(),
+                // present.rs polls the frame-latency waitable itself so a slow
+                // display can never stall the render thread inside get_current_texture.
+                latency_waitable_object: wgpu::Dx12UseFrameLatencyWaitableObject::DontWait,
                 ..Default::default()
             },
             ..Default::default()

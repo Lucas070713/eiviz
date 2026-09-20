@@ -34,6 +34,8 @@ pub struct Presenter {
     ready: bool,
     occluded_streak: u32,
     native: NativeSurface,
+    /// A DXGI frame-latency slot was taken and not yet spent by a present.
+    frame_slot: bool,
 }
 
 #[derive(Default)]
@@ -205,6 +207,29 @@ impl Presenters {
         // — attach reply, mixer_destroy join, or a sleeping integration test.
         reconfigure_pending_inner(device, self);
     }
+
+    /// Highest current refresh rate (Hz) among the monitors hosting the
+    /// currently attached surfaces. #233: eiviz composes at the mix clock but
+    /// must present at the panel's own rate, or windowed VRR follows the
+    /// (much slower) mix cadence and flickers the whole display.
+    pub fn display_hz(&self) -> Option<u32> {
+        self.by_key
+            .values()
+            .chain(self.monitors.values())
+            .filter_map(|presenter| surface_refresh_hz(presenter.native))
+            .max()
+    }
+}
+
+/// Presenting at the video rate makes windowed VRR follow that cadence and
+/// flicker the whole display (#233). Repaint at the panel's rate instead.
+pub fn repaint_rate(
+    display_hz: Option<u32>,
+    master: crate::clock::Rate,
+) -> Option<crate::clock::Rate> {
+    let display_hz = display_hz?;
+    (f64::from(display_hz) >= master.as_f64() * 1.5)
+        .then(|| crate::clock::Rate::or_default(display_hz, 1))
 }
 
 fn reconfigure_pending_inner(device: &GpuDevice, presenters: &mut Presenters) {
@@ -307,8 +332,12 @@ pub(crate) fn prepare_surface(
     let caps = surface.get_capabilities(adapter);
     config.format = pick_surface_format(&caps.formats);
     config.alpha_mode = pick_alpha_mode(&caps.alpha_modes);
-    config.present_mode = pick_present_mode(&caps.present_modes);
-    crate::diag::info(&format!("surface present_mode={:?}", config.present_mode));
+    let backend = adapter.get_info().backend;
+    config.present_mode = pick_present_mode(backend, &caps.present_modes);
+    crate::diag::info(&format!(
+        "surface present_mode={:?} backend={:?}",
+        config.present_mode, backend
+    ));
     configure_surface(device, &surface, &config)?;
     Ok(PreparedSurface { surface, config })
 }
@@ -339,6 +368,7 @@ fn presenter_from_prepared(
         ready: true,
         occluded_streak: 0,
         native,
+        frame_slot: false,
     })
 }
 
@@ -471,6 +501,9 @@ fn apply_pending_size(device: &GpuDevice, presenter: &mut Presenter) {
         presenter.bind_key = 0;
         presenter.pending = None;
         presenter.ready = true;
+        // ResizeBuffers hands out a fresh waitable; any slot taken on the old
+        // one is gone with it.
+        presenter.frame_slot = false;
     }
 }
 
@@ -499,14 +532,25 @@ fn configure_surface(
     Err("surface configure failed".into())
 }
 
-fn pick_present_mode(modes: &[wgpu::PresentMode]) -> wgpu::PresentMode {
+fn pick_present_mode(backend: wgpu::Backend, modes: &[wgpu::PresentMode]) -> wgpu::PresentMode {
     const PREFERRED: [wgpu::PresentMode; 3] = [
         wgpu::PresentMode::Mailbox,
         wgpu::PresentMode::Fifo,
         wgpu::PresentMode::FifoRelaxed,
     ];
-    PREFERRED
-        .into_iter()
+    const DX12_PREFERRED: [wgpu::PresentMode; 1] = [wgpu::PresentMode::Fifo];
+
+    let preferred: &[wgpu::PresentMode] = match backend {
+        // DX12 Mailbox is Present(0, 0). The render thread repaints at the panel's
+        // rate (#233), so an unthrottled present would only queue frames the display
+        // never scans out. Fifo is Present(1, 0) — exactly one per vblank — and
+        // take_frame_slot keeps it from blocking the mix clock.
+        wgpu::Backend::Dx12 => &DX12_PREFERRED,
+        _ => &PREFERRED,
+    };
+    preferred
+        .iter()
+        .copied()
         .find(|mode| modes.contains(mode))
         .unwrap_or(wgpu::PresentMode::Fifo)
 }
@@ -576,6 +620,106 @@ fn native_client_size(_surface: NativeSurface) -> Option<(u32, u32)> {
     None
 }
 
+#[cfg(windows)]
+fn surface_refresh_hz(surface: NativeSurface) -> Option<u32> {
+    const MONITOR_DEFAULTTONEAREST: u32 = 2;
+    const ENUM_CURRENT_SETTINGS: u32 = u32::MAX; // (DWORD)-1
+    const CCHDEVICENAME: usize = 32;
+    const CCHFORMNAME: usize = 32;
+
+    #[repr(C)]
+    struct WinRect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    // Layout-only fields (never read individually) exist so this struct's
+    // size and offsets match the Win32 MONITORINFOEXW exactly.
+    #[allow(dead_code)]
+    #[repr(C)]
+    struct MonitorInfoExW {
+        cb_size: u32,
+        rc_monitor: WinRect,
+        rc_work: WinRect,
+        dw_flags: u32,
+        sz_device: [u16; CCHDEVICENAME],
+    }
+
+    // Same as above: most fields are unused padding kept only so this
+    // mirrors the real Win32 DEVMODEW (220 bytes on Unicode Windows).
+    #[allow(dead_code)]
+    #[repr(C)]
+    struct DevModeW {
+        dm_device_name: [u16; CCHDEVICENAME],
+        dm_spec_version: u16,
+        dm_driver_version: u16,
+        dm_size: u16,
+        dm_driver_extra: u16,
+        dm_fields: u32,
+        dm_union1: [u32; 4], // dmPosition / dmDisplayOrientation / dmDisplayFixedOutput
+        dm_color: i16,
+        dm_duplex: i16,
+        dm_y_resolution: i16,
+        dm_tt_option: i16,
+        dm_collate: i16,
+        dm_form_name: [u16; CCHFORMNAME],
+        dm_log_pixels: u16,
+        dm_bits_per_pel: u32,
+        dm_pels_width: u32,
+        dm_pels_height: u32,
+        dm_display_flags_or_nup: u32,
+        dm_display_frequency: u32,
+        dm_icm_method: u32,
+        dm_icm_intent: u32,
+        dm_media_type: u32,
+        dm_dither_type: u32,
+        dm_reserved1: u32,
+        dm_reserved2: u32,
+        dm_panning_width: u32,
+        dm_panning_height: u32,
+    }
+
+    if surface.kind != crate::abi::NATIVE_WIN32_HWND {
+        return None;
+    }
+    unsafe extern "system" {
+        fn MonitorFromWindow(hwnd: isize, flags: u32) -> isize;
+        fn GetMonitorInfoW(hmonitor: isize, info: *mut MonitorInfoExW) -> i32;
+        fn EnumDisplaySettingsW(
+            device_name: *const u16,
+            mode_num: u32,
+            dev_mode: *mut DevModeW,
+        ) -> i32;
+    }
+    let hmonitor = unsafe { MonitorFromWindow(surface.handle, MONITOR_DEFAULTTONEAREST) };
+    if hmonitor == 0 {
+        return None;
+    }
+    // SAFETY: cb_size is set before the call, as GetMonitorInfoW requires.
+    let mut info: MonitorInfoExW = unsafe { std::mem::zeroed() };
+    info.cb_size = std::mem::size_of::<MonitorInfoExW>() as u32;
+    if unsafe { GetMonitorInfoW(hmonitor, &mut info) } == 0 {
+        return None;
+    }
+    // SAFETY: dm_size is set before the call, as EnumDisplaySettingsW requires.
+    let mut devmode: DevModeW = unsafe { std::mem::zeroed() };
+    devmode.dm_size = std::mem::size_of::<DevModeW>() as u16;
+    if unsafe { EnumDisplaySettingsW(info.sz_device.as_ptr(), ENUM_CURRENT_SETTINGS, &mut devmode) }
+        == 0
+    {
+        return None;
+    }
+    // Windows uses 0 and 1 to mean "use the driver's default", not a real rate.
+    (devmode.dm_display_frequency > 1).then_some(devmode.dm_display_frequency)
+}
+
+#[cfg(not(windows))]
+fn surface_refresh_hz(_surface: NativeSurface) -> Option<u32> {
+    None
+}
+
 fn sync_presenter_extent(device: &GpuDevice, presenter: &mut Presenter) {
     let extent = live_extent(presenter);
     if presenter.ready
@@ -589,6 +733,38 @@ fn sync_presenter_extent(device: &GpuDevice, presenter: &mut Presenter) {
     apply_pending_size(device, presenter);
 }
 
+/// A DXGI frame-latency slot is a semaphore: a successful wait consumes one
+/// and only a Present gives it back. Once taken, `presenter.frame_slot` remembers
+/// it so a later retry within the same acquire (or the next frame, if the surface
+/// was not ready) reuses it instead of polling the waitable again and leaking slots.
+#[cfg(windows)]
+fn take_frame_slot(presenter: &mut Presenter) -> bool {
+    use windows::Win32::Foundation::WAIT_OBJECT_0;
+    use windows::Win32::System::Threading::WaitForSingleObject;
+
+    if presenter.frame_slot {
+        return true;
+    }
+    // SAFETY: the handle is only used while the hal guard keeps the swapchain
+    // alive; a 0 ms wait never blocks.
+    let ready = unsafe {
+        match presenter.surface.as_hal::<wgpu::hal::api::Dx12>() {
+            Some(hal) => match hal.waitable_handle() {
+                Some(handle) => WaitForSingleObject(handle, 0) == WAIT_OBJECT_0,
+                None => true,
+            },
+            None => true,
+        }
+    };
+    presenter.frame_slot = ready;
+    ready
+}
+
+#[cfg(not(windows))]
+fn take_frame_slot(_presenter: &mut Presenter) -> bool {
+    true
+}
+
 fn acquire_surface_texture(
     device: &GpuDevice,
     presenter: &mut Presenter,
@@ -600,6 +776,11 @@ fn acquire_surface_texture(
     for _ in 0..8 {
         sync_presenter_extent(device, presenter);
         if !presenter.ready {
+            return None;
+        }
+        // The display has not retired a queued frame yet. Drop this preview frame
+        // instead of letting Present(1, 0) throttle the mix clock.
+        if !take_frame_slot(presenter) {
             return None;
         }
         // wgpu 30 panics in Surface::get_current_texture when the HAL surface was
@@ -628,6 +809,9 @@ fn acquire_surface_texture(
                     continue;
                 }
                 presenter.occluded_streak = 0;
+                // This texture is always presented by submit_presents, which
+                // spends the slot; the next acquire must poll for a new one.
+                presenter.frame_slot = false;
                 return Some(texture);
             }
             wgpu::CurrentSurfaceTexture::Suboptimal(texture) => {
@@ -878,7 +1062,10 @@ mod tests {
     #[test]
     fn prefers_fifo_over_immediate() {
         let modes = [wgpu::PresentMode::Fifo, wgpu::PresentMode::Immediate];
-        assert_eq!(pick_present_mode(&modes), wgpu::PresentMode::Fifo);
+        assert_eq!(
+            pick_present_mode(wgpu::Backend::Vulkan, &modes),
+            wgpu::PresentMode::Fifo
+        );
     }
 
     #[test]
@@ -888,7 +1075,23 @@ mod tests {
             wgpu::PresentMode::Fifo,
             wgpu::PresentMode::Immediate,
         ];
-        assert_eq!(pick_present_mode(&modes), wgpu::PresentMode::Mailbox);
+        assert_eq!(
+            pick_present_mode(wgpu::Backend::Vulkan, &modes),
+            wgpu::PresentMode::Mailbox
+        );
+    }
+
+    #[test]
+    fn dx12_presents_vsynced() {
+        let modes = [
+            wgpu::PresentMode::Mailbox,
+            wgpu::PresentMode::Fifo,
+            wgpu::PresentMode::Immediate,
+        ];
+        assert_eq!(
+            pick_present_mode(wgpu::Backend::Dx12, &modes),
+            wgpu::PresentMode::Fifo
+        );
     }
 
     #[cfg(windows)]
@@ -900,5 +1103,35 @@ mod tests {
             handle.hinstance.is_some(),
             "Vulkan WSI requires Win32 hinstance"
         );
+    }
+
+    fn rate(num: u32, den: u32) -> crate::clock::Rate {
+        crate::clock::Rate::new(num, den).expect("rate")
+    }
+
+    #[test]
+    fn repaint_rate_engages_for_360hz_panel_over_59_94_mix() {
+        let master = rate(60_000, 1_001);
+        let repaint = super::repaint_rate(Some(360), master).expect("360Hz is well above 59.94");
+        assert_eq!(repaint, crate::clock::Rate::or_default(360, 1));
+    }
+
+    #[test]
+    fn repaint_rate_stays_off_for_60hz_panel_over_59_94_mix() {
+        let master = rate(60_000, 1_001);
+        assert!(super::repaint_rate(Some(60), master).is_none());
+    }
+
+    #[test]
+    fn repaint_rate_engages_for_60hz_panel_over_30hz_mix() {
+        let master = rate(30, 1);
+        let repaint = super::repaint_rate(Some(60), master).expect("60Hz is well above 30");
+        assert_eq!(repaint, crate::clock::Rate::or_default(60, 1));
+    }
+
+    #[test]
+    fn repaint_rate_none_when_display_hz_unknown() {
+        let master = rate(60_000, 1_001);
+        assert!(super::repaint_rate(None, master).is_none());
     }
 }
